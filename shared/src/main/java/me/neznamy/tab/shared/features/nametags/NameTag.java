@@ -30,6 +30,8 @@ import java.util.*;
 public class NameTag extends RefreshableFeature implements NameTagManager, JoinListener, QuitListener,
         Loadable, WorldSwitchListener, ServerSwitchListener, VanishListener, CustomThreaded, ProxyFeature, GroupListener {
 
+    private static final int TEAM_RENAME_DEBOUNCE_MS = 50;
+
     private final ThreadExecutor customThread = new ThreadExecutor("TAB NameTag Thread");
     private OnlinePlayers onlinePlayers;
     private final TeamConfiguration configuration;
@@ -41,6 +43,9 @@ public class NameTag extends RefreshableFeature implements NameTagManager, JoinL
     private final int teamOptions;
     private final DisableChecker disableChecker;
     @Nullable private final ProxySupport proxy = TAB.getInstance().getFeatureManager().getFeature(TabConstants.Feature.PROXY_SUPPORT);
+    private final Object pendingTeamRenamesLock = new Object();
+    private final Map<UUID, String> pendingTeamRenames = new HashMap<>();
+    private boolean teamRenameTaskScheduled;
 
     /**
      * Constructs new instance and registers sub-features.
@@ -359,20 +364,47 @@ public class NameTag extends RefreshableFeature implements NameTagManager, JoinL
      *          New team name to use
      */
     public void updateTeamName(@NonNull TabPlayer player, @NonNull String newTeamName) {
-        customThread.execute(new TimedCaughtTask(TAB.getInstance().getCpu(), () -> {
-            // Function ran before onJoin did (super rare), drop action since onJoin will use new team name anyway
-            if (player.teamData.teamName == null) return;
+        // Function ran before onJoin did (super rare), drop action since onJoin will use new team name anyway
+        if (player.teamData.teamName == null) return;
+        if (newTeamName.equals(player.teamData.teamName)) return;
+        synchronized (pendingTeamRenamesLock) {
+            pendingTeamRenames.put(player.getUniqueId(), newTeamName);
+            if (teamRenameTaskScheduled) return;
+            teamRenameTaskScheduled = true;
+        }
+        customThread.executeLater(new TimedCaughtTask(TAB.getInstance().getCpu(), this::flushPendingTeamRenames,
+                getFeatureName(), "Updating team name"), TEAM_RENAME_DEBOUNCE_MS);
+    }
 
-            if (player.teamData.isDisabled()) {
-                player.teamData.teamName = newTeamName;
+    private void flushPendingTeamRenames() {
+        Map<UUID, String> renames;
+        synchronized (pendingTeamRenamesLock) {
+            if (pendingTeamRenames.isEmpty()) {
+                teamRenameTaskScheduled = false;
                 return;
             }
+            renames = new HashMap<>(pendingTeamRenames);
+            pendingTeamRenames.clear();
+            teamRenameTaskScheduled = false;
+        }
+        for (Map.Entry<UUID, String> entry : renames.entrySet()) {
+            TabPlayer player = TAB.getInstance().getPlayer(entry.getKey());
+            if (player == null) continue;
+            String newTeamName = entry.getValue();
+            if (player.teamData.teamName == null) continue;
+            if (newTeamName.equals(player.teamData.teamName)) continue;
+            if (player.teamData.isDisabled()) {
+                player.teamData.teamName = newTeamName;
+                continue;
+            }
             for (TabPlayer viewer : onlinePlayers.getPlayers()) {
+                if (player.teamData.vanishedFor.contains(viewer.getUniqueId())) continue;
+                if (viewer != player && !viewer.canSee(player)) continue;
                 viewer.getScoreboard().renameTeam(player.teamData.teamName, newTeamName);
             }
             player.teamData.teamName = newTeamName;
             sendProxyMessage(player);
-        }, getFeatureName(), "Updating team name"));
+        }
     }
 
     public void hideNameTag(@NonNull TabPlayer player, @NonNull NameTagInvisibilityReason reason, @NonNull String cpuReason,
